@@ -1,0 +1,20 @@
+# Deep Learning Framework
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Computer Vision
+opencv-python>=4.8.0
+pytesseract>=0.3.10
+
+# AI/ML Tools
+ultralytics>=8.2.103
+
+# Additional Dependencies
+requests>=2.31.0
+
+# Optional but recommended
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Dataset
+huggingface_hub
