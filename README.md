@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ---
 
-## Notes / Lưu ý
+## Notes
 
 - If you have multiple cameras, change the index in `cv2.VideoCapture(0)`.  
 - If you want to use a different model, change the path in `yolo/detection.py`.  
