@@ -2,7 +2,8 @@ from yolo.types import DetectedObject
 
 def detect_objects(frame, model):
     """
-    Function to detect objects in a frame and return bounding boxes
+    Parameters: frame, model
+    @Return: bounding boxes
     """
     results = model.track(frame, persist=True)
     detected_objects = []

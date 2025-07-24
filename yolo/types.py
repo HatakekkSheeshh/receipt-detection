@@ -1,7 +1,4 @@
 class DetectedObject:
-    """
-    Class to represent a detected object with string representation
-    """
     def __init__(self, track_id, bbox, label, class_id, confidence):
         self.track_id = track_id
         self.bbox = bbox
