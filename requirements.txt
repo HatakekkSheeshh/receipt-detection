@@ -18,3 +18,7 @@ pillow>=10.0.0
 
 # Dataset
 huggingface_hub
+
+# Easy OCR
+scikit-image
+bidi
