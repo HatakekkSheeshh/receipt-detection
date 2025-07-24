@@ -1,6 +1,6 @@
 # receipt-detection
 
-## Description / Mô tả
+## Description 
 
 Detect receipts in real-time from webcam using YOLOv8.  
 
