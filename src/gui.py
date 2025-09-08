@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Complete OCR Pipeline with PySide6 GUI
-Integrated YOLO Detection + OCR Model + PaddleOCR comparison
+Integrated YOLO Detection + OCR Model and PaddleOCR comparison
 """
 
 import sys
@@ -11,7 +11,6 @@ import json
 import cv2
 import numpy as np
 from pathlib import Path
-import time
 from datetime import datetime
 import time
 from typing import Dict, List, Any, Optional
@@ -50,8 +49,8 @@ class CustomOCREngine:
     """Custom OCR Engine using DBNet + SVTR pipeline (matching benchmark_ocr.py)"""
     
     def __init__(self):
-        self.ocr_engine = None
-        self.baseline_engine = None
+        self.det_engine = None
+        self.rec_engine = None
         self.initialized = False
     
     def initialize(self):
@@ -59,168 +58,380 @@ class CustomOCREngine:
         try:
             from paddleocr import PaddleOCR
             
-            # Use the custom detection model path
-            det_model_path = str("..\dbnet\model")
-            rec_model_path = str("..\svtr\model")
+            # Get detection model path
+            src_folder = Path(__file__).parent
+            project_root = src_folder.parent
+            det_model_path = str(project_root / "dbnet" / "model")
+            rec_model_path = str(project_root / "svtr" / "model")
             
-            self.ocr_engine = PaddleOCR(
+            # Detection-only engine (DBNet)
+            print("🔧 Loading DBNet detection engine...")
+            self.det_engine = PaddleOCR(
                 det_model_dir=det_model_path,
-                rec_model_dir=rec_model_path,
+                rec=False,  # Disable recognition
                 use_angle_cls=False,
                 use_gpu=False,
-                lang='en'
+                show_log=False
             )
-
-            self.baseline_engine = PaddleOCR(
+            
+            # Recognition with SVTR
+            print("🔧 Loading SVTR recognition engine...")
+            self.rec_engine = PaddleOCR(
+                det=False,  # Disable detection
+                rec=True,   # Enable recognition only
+                use_angle_cls=False,
+                use_gpu=False,
+                lang='en',
+                rec_model_dir=rec_model_path,  # Use default SVTR model
+                rec_algorithm='SVTR_LCNet',  # Specify SVTR algorithm
+                show_log=False
+            )
+            
+            self.initialized = True
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize Custom OCR Engine: {e}")
+            # Fallback to default recognition
+            try:
+                self.rec_engine = PaddleOCR(
+                    det=False,
+                    rec=True,
+                    use_angle_cls=False,
+                    use_gpu=False,
+                    lang='en',
+                    show_log=False
+                )
+                self.initialized = True
+                return True
+            except:
+                return False
+    
+    def preprocess_image(self, image, min_height=64, min_width=64, max_height=1024, max_width=1024):
+        """Preprocess image for OCR detection (from benchmark_ocr.py)"""
+        h, w = image.shape[:2]
+        
+        # Apply light enhancement if needed
+        processed_image = image.copy()
+        
+        # Only apply enhancement if image is very dark/low contrast
+        gray = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        
+        if mean_brightness < 80 or mean_brightness > 220:
+            # Apply mild contrast enhancement
+            lab = cv2.cvtColor(processed_image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            processed_image = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        
+        # Resize if image is too small
+        if h < min_height or w < min_width:
+            scale_h = min_height / h if h < min_height else 1.0
+            scale_w = min_width / w if w < min_width else 1.0
+            scale = max(scale_h, scale_w)
+            
+            new_h = max(int(h * scale), min_height)
+            new_w = max(int(w * scale), min_width)
+            
+            processed_image = cv2.resize(processed_image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        
+        # Resize if image is too large
+        elif h > max_height or w > max_width:
+            scale_h = max_height / h if h > max_height else 1.0
+            scale_w = max_width / w if w > max_width else 1.0
+            scale = min(scale_h, scale_w)
+            
+            new_h = int(h * scale)
+            new_w = int(w * scale)
+            
+            processed_image = cv2.resize(processed_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        return processed_image
+    
+    def dbnet_postprocess(self, image, text_box, min_width=16, min_height=12, max_aspect_ratio=25):
+        """Crop text regions from DBNet output (from benchmark_ocr.py)"""
+        # DBNet text_box format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        points = np.array(text_box, dtype=np.float32).reshape(-1, 2)
+        
+        # Get bounding rectangle from the 4 corner points
+        rect = cv2.boundingRect(points)
+        x, y, w, h = rect
+        
+        # Size filtering
+        if w < min_width or h < min_height:
+            return None
+        
+        # Aspect ratio filtering
+        aspect_ratio = max(w, h) / max(min(w, h), 1)
+        if aspect_ratio > max_aspect_ratio:
+            return None
+        
+        # Size limit
+        if w > 1500 or h > 800:
+            return None
+        
+        # Add padding
+        padding = 8
+        img_h, img_w = image.shape[:2]
+        
+        x1 = max(0, x - padding)
+        y1 = max(0, y - padding)
+        x2 = min(img_w, x + w + padding)
+        y2 = min(img_h, y + h + padding)
+        
+        # Ensure minimum size after padding
+        final_w = x2 - x1
+        final_h = y2 - y1
+        
+        if final_w < min_width or final_h < min_height:
+            return None
+        
+        # Crop the region
+        cropped = image[y1:y2, x1:x2]
+        
+        if cropped.size == 0:
+            return None
+            
+        return cropped
+    
+    def svtr_preprocess(self, image):
+        """Preprocess cropped text region for SVTR input (from benchmark_ocr.py)"""
+        if image is None or image.size == 0:
+            return None
+            
+        h, w = image.shape[:2]
+        
+        # Minimum size check for SVTR
+        if h < 12 or w < 16:
+            return None
+        
+        processed = image.copy()
+        
+        # SVTR-specific preprocessing
+        # 1. Ensure adequate height for SVTR (works best with height >= 32)
+        target_height = 32  # SVTR optimal height
+        if h < target_height:
+            scale = target_height / h
+            new_w = int(w * scale)
+            new_h = target_height
+            processed = cv2.resize(processed, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            h, w = new_h, new_w
+        
+        # 2. Apply contrast enhancement for better SVTR recognition
+        gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        
+        # More aggressive enhancement for SVTR
+        if mean_brightness < 100 or mean_brightness > 180:
+            # Apply CLAHE for better text contrast
+            lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+            l = clahe.apply(l)
+            processed = cv2.merge([l, a, b])
+            processed = cv2.cvtColor(processed, cv2.COLOR_LAB2BGR)
+        
+        # 3. Handle extreme aspect ratios for SVTR
+        aspect_ratio = w / h
+        if aspect_ratio > 20:  # Very wide text
+            # Slightly reduce width to improve recognition
+            new_w = min(w, h * 18)
+            if new_w != w:
+                processed = cv2.resize(processed, (new_w, h), interpolation=cv2.INTER_AREA)
+        
+        return processed
+    
+    def predict(self, image_np: np.ndarray) -> List[Dict]:
+        """Predict text using DBNet + SVTR pipeline (from benchmark_ocr.py)"""
+        if not self.initialized:
+            if not self.initialize():
+                return []
+        
+        try:
+            # Step 1: Preprocess image
+            processed_image = self.preprocess_image(image_np)
+            
+            # Step 2: Detection with DBNet
+            det_result = self.det_engine.ocr(processed_image, rec=False)
+            
+            if not det_result or not det_result[0]:
+                return []
+            
+            detected_boxes = det_result[0]
+            
+            # Step 3: Recognition with SVTR
+            recognized_results = []
+            
+            for i, text_box in enumerate(detected_boxes):
+                # Crop text region from DBNet output
+                text_region = self.dbnet_postprocess(processed_image, text_box)
+                if text_region is None:
+                    continue
+                
+                # Preprocess for SVTR
+                svtr_input = self.svtr_preprocess(text_region)
+                if svtr_input is None:
+                    continue
+                
+                try:
+                    # Recognition with SVTR
+                    svtr_result = self.rec_engine.ocr(svtr_input, det=False, rec=True, cls=False)
+                    
+                    if svtr_result and len(svtr_result) > 0 and svtr_result[0] is not None:
+                        for line in svtr_result[0]:
+                            if line is not None and len(line) >= 2:
+                                # SVTR returns [text, confidence] format in rec-only mode
+                                text_info = line
+                                if len(text_info) >= 2:
+                                    text = str(text_info[0]) if text_info[0] is not None else ""
+                                    confidence = float(text_info[1]) if text_info[1] is not None else 0.0
+                                    
+                                    # Filter results
+                                    if confidence > 0.2 and text.strip() and len(text.strip()) >= 1:
+                                        recognized_results.append({
+                                            'text': text.strip(),
+                                            'confidence': confidence,
+                                            'coordinates': text_box
+                                        })
+                                        break  # Take only the best result per region
+                                
+                except Exception as e:
+                    print(f"   ⚠️ SVTR recognition failed for region {i}: {e}")
+                    continue
+            
+            return recognized_results
+            
+        except Exception as e:
+            print(f"❌ Custom OCR prediction failed: {e}")
+            return []
+        
+class BaselineOCREngine:
+    """Baseline PaddleOCR Engine (matching benchmark_ocr.py)"""
+    
+    def __init__(self):
+        self.ocr = None
+        self.initialized = False
+    
+    def initialize(self):
+        """Initialize baseline PaddleOCR"""
+        try:
+            from paddleocr import PaddleOCR
+            
+            self.ocr = PaddleOCR(
                 use_angle_cls=False,
                 use_gpu=False,
                 lang='en',
                 show_log=False
             )
-
             self.initialized = True
             return True
         except Exception as e:
-            print(f"❌ Failed to initialize PaddleOCR: {e}")
+            print(f"❌ Failed to initialize Baseline PaddleOCR: {e}")
             return False
     
-    def predict_ocr(self, image_np: np.ndarray) -> List[Dict]:
-        """Predict text from image array"""
-        if not self.initialized and not self.initialize():
-            return {
-                'model_name': 'OCR Model',
-                'texts': [], 
-                'total_texts': 0, 
-                'avg_confidence': 0, 
-                'processing_time': 0,
-                'error': 'OCR engine not initialized'
-            }
+    def preprocess_image(self, image, min_height=64, min_width=64, max_height=1024, max_width=1024):
+        """Preprocess image for baseline OCR (from benchmark_ocr.py)"""
+        h, w = image.shape[:2]
+        
+        # Apply light enhancement if needed
+        processed_image = image.copy()
+        
+        # Only apply enhancement if image is very dark/low contrast
+        gray = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        
+        if mean_brightness < 80 or mean_brightness > 220:
+            # Apply mild contrast enhancement
+            lab = cv2.cvtColor(processed_image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            processed_image = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        
+        # Resize if image is too small
+        if h < min_height or w < min_width:
+            scale_h = min_height / h if h < min_height else 1.0
+            scale_w = min_width / w if w < min_width else 1.0
+            scale = max(scale_h, scale_w)
+            
+            new_h = max(int(h * scale), min_height)
+            new_w = max(int(w * scale), min_width)
+            
+            processed_image = cv2.resize(processed_image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        
+        # Resize if image is too large
+        elif h > max_height or w > max_width:
+            scale_h = max_height / h if h > max_height else 1.0
+            scale_w = max_width / w if w > max_width else 1.0
+            scale = min(scale_h, scale_w)
+            
+            new_h = int(h * scale)
+            new_w = int(w * scale)
+            
+            processed_image = cv2.resize(processed_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        return processed_image
+    
+    def predict(self, image_np: np.ndarray) -> List[Dict]:
+        """Predict text from image array using baseline PaddleOCR (from benchmark_ocr.py)"""
+        if not self.initialized:
+            if not self.initialize():
+                return []
         
         try:
-            # Convert numpy array to image path temporarily
-            temp_path = f"temp_ocr_input_{int(time.time())}.jpg"  # Added timestamp to avoid conflicts
-            cv2.imwrite(temp_path, image_np)
+            processed_image = self.preprocess_image(image_np)
+            result = self.ocr.ocr(processed_image, cls=False)
             
-            start_time = time.time()
-            result = self.ocr_engine.ocr(temp_path, cls=False)
-            processing_time = time.time() - start_time
-
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if result is None or not isinstance(result, list) or len(result) == 0:
+                result = [[]]
+            elif result[0] is None:
+                result = [[]]
             
-            texts = self._parse_result(result, "OCR Model")
+            # Parse baseline results
+            parsed_results = []
             
-            return {
-                'model_name': 'OCR Model',
-                'texts': texts,
-                'total_texts': len(texts),
-                'processing_time': processing_time,
-                'avg_confidence': np.mean([t['confidence'] for t in texts]) if texts else 0,
-                'raw_result': texts
-            }
+            if result and len(result) > 0 and result[0] is not None:
+                for line in result[0]:
+                    if line is not None and len(line) >= 2:
+                        coords = line[0]
+                        text_info = line[1]
+                        
+                        if text_info is not None and len(text_info) >= 2:
+                            text = str(text_info[0]) if text_info[0] is not None else ""
+                            confidence = float(text_info[1]) if text_info[1] is not None else 0.0
+                            
+                            if confidence > 0.1 and text.strip() and len(text.strip()) > 0:
+                                parsed_results.append({
+                                    'text': text.strip(),
+                                    'confidence': confidence,
+                                    'coordinates': coords
+                                })
             
-        except Exception as e:
-            print(f"❌ OCR Model prediction failed: {e}")
-            return {
-                'model_name': 'OCR Model',
-                'texts': [],
-                'total_texts': 0,
-                'processing_time': 0,
-                'avg_confidence': 0,
-                'error': str(e)
-            }
-
-    def predict_baseline(self, image_np: np.ndarray) -> List[Dict]:
-        """Predict text using baseline PaddleOCR"""
-        if not self.initialized and not self.initialize():
-            return {
-                'model_name': 'PaddleOCR',
-                'texts': [], 
-                'total_texts': 0, 
-                'avg_confidence': 0, 
-                'processing_time': 0,
-                'error': 'Baseline engine not initialized'
-            }
-        
-        try:
-            # Save image temporarily
-            temp_path = f"temp_baseline_input_{int(time.time())}.jpg"  # Added timestamp
-            cv2.imwrite(temp_path, image_np)
-            
-            start_time = time.time()
-            result = self.baseline_engine.ocr(temp_path, cls=False)  # Fixed variable name
-            processing_time = time.time() - start_time
-            
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            
-            texts = self._parse_result(result, "PaddleOCR")
-            
-            return {
-                'model_name': 'PaddleOCR',
-                'texts': texts,
-                'total_texts': len(texts),
-                'processing_time': processing_time,
-                'avg_confidence': np.mean([t['confidence'] for t in texts]) if texts else 0,
-                'raw_result': texts
-            }
+            return parsed_results
             
         except Exception as e:
             print(f"❌ Baseline OCR prediction failed: {e}")
-            return {
-                'model_name': 'PaddleOCR',
-                'texts': [],
-                'total_texts': 0,
-                'processing_time': 0,
-                'avg_confidence': 0,
-                'error': str(e)
-            }
+            return []
 
-    def _parse_result(self, result, model_name: str) -> List[Dict]:
-        """Parse PaddleOCR result into standardized format"""
-        output_data = []
-        
-        if result and len(result[0]) > 0:
-            for line in result[0]:
-                coords = line[0]  # Bounding box coordinates
-                text_info = line[1]  # (text, confidence)
-                text = text_info[0]
-                confidence = text_info[1]
-                
-                # Create bounding box format for consistency
-                bbox = [
-                    min([p[0] for p in coords]),  # x1
-                    min([p[1] for p in coords]),  # y1
-                    max([p[0] for p in coords]),  # x2
-                    max([p[1] for p in coords])   # y2
-                ]
-                
-                output_data.append({
-                    "text": text,
-                    "confidence": confidence,
-                    "coordinates": coords,
-                    "bbox": bbox,  # Added for UI compatibility
-                    "model": model_name
-                })
-        
-        return output_data
-    
 class OCRProcessingThread(QThread):
     """Background thread for OCR processing (fixed to match benchmark_ocr.py)"""
     progress_updated = Signal(str)
     yolo_completed = Signal(dict)
-    ocr_completed = Signal(dict) 
-    baseline_completed = Signal(dict)
+    custom_completed = Signal(dict)  # Changed from svtr_completed
+    baseline_completed = Signal(dict)  # Changed from paddle_completed
     processing_completed = Signal(dict)
     error_occurred = Signal(str)
     
-    def __init__(self, image_path: str, yolo_detector, ocr_engine):
+    def __init__(self, image_path: str, yolo_detector, custom_engine, baseline_engine):
         super().__init__()
         self.image_path = image_path
         self.yolo_detector = yolo_detector
-        self.ocr_engine = ocr_engine
+        self.custom_engine = custom_engine  # DBNet + SVTR pipeline
+        self.baseline_engine = baseline_engine  # Standard PaddleOCR
         
     def run(self):
         """Main processing pipeline (matching benchmark_ocr.py logic)"""
@@ -229,8 +440,8 @@ class OCRProcessingThread(QThread):
                 'input_image': self.image_path,
                 'timestamp': datetime.now().isoformat(),
                 'yolo_detection': None,
-                'ocr_results': None,
-                'baseline_results': None,
+                'custom_results': None,  # DBNet + SVTR results
+                'baseline_results': None,  # PaddleOCR results
                 'comparison': None
             }
             
@@ -250,21 +461,21 @@ class OCRProcessingThread(QThread):
             
             self.progress_updated.emit(f"✅ Best bill found (confidence: {best_detection['confidence']:.3f})")
             
-            # Step 2: OCR Model Processing
-            self.progress_updated.emit("🤖 OCR Model: Processing bill text...")
-            ocr_results = self._ocr_processing(bill_crop)
-            results['ocr_results'] = ocr_results
-            self.ocr_completed.emit(ocr_results)
+            # Step 2: Custom OCR Processing (DBNet + SVTR)
+            self.progress_updated.emit("🤖 Custom: Processing with DBNet + SVTR...")
+            custom_results = self._custom_processing(bill_crop)
+            results['custom_results'] = custom_results
+            self.custom_completed.emit(custom_results)
             
-            # Step 3: PaddleOCR Processing
-            self.progress_updated.emit("🧠 PaddleOCR: Processing bill text...")
+            # Step 3: Baseline OCR Processing (Standard PaddleOCR)
+            self.progress_updated.emit("🧠 Baseline: Processing with PaddleOCR...")
             baseline_results = self._baseline_processing(bill_crop)
             results['baseline_results'] = baseline_results
             self.baseline_completed.emit(baseline_results)
             
             # Step 4: Comparison
             self.progress_updated.emit("📊 Generating comparison...")
-            comparison = self._generate_comparison(ocr_results, baseline_results)
+            comparison = self._generate_comparison(custom_results, baseline_results)
             results['comparison'] = comparison
             
             # Step 5: Save results
@@ -334,27 +545,58 @@ class OCRProcessingThread(QThread):
         except Exception as e:
             raise Exception(f"YOLO detection failed: {e}")
     
-    def _ocr_processing(self, bill_crop: np.ndarray) -> Dict:
-        """Custom OCR Model text recognition"""
+    def _custom_processing(self, bill_crop: np.ndarray) -> Dict:
+        """Custom OCR processing using DBNet + SVTR (matching benchmark_ocr.py)"""
         try:
-            # Run OCR Model prediction
-            ocr_result = self.ocr_engine.predict_ocr(bill_crop)
-            return ocr_result
-        
+            start_time = time.time()
+            texts = self.custom_engine.predict(bill_crop)
+            processing_time = time.time() - start_time
+            
+            # Calculate metrics similar to benchmark_ocr.py
+            confidences = [t.get('confidence', 0) for t in texts]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            high_confidence_count = sum(1 for c in confidences if c > 0.9)
+            
+            return {
+                'model_name': 'Custom DBNet+SVTR',
+                'texts': texts,
+                'total_texts': len(texts),
+                'processing_time': processing_time,
+                'avg_confidence': avg_confidence,
+                'high_confidence_count': high_confidence_count,
+                'confidences': confidences
+            }
+            
         except Exception as e:
             return {
-                'model_name': 'OCR Model',
+                'model_name': 'Custom DBNet+SVTR',
                 'texts': [],
                 'total_texts': 0,
-                'avg_confidence': 0,
+                'processing_time': 0,
                 'error': str(e)
             }
     
     def _baseline_processing(self, bill_crop: np.ndarray) -> Dict:
-        """PaddleOCR text recognition"""
+        """Baseline OCR processing using standard PaddleOCR (matching benchmark_ocr.py)"""
         try:
-            baseline_results = self.ocr_engine.predict_baseline(bill_crop)
-            return baseline_results
+            start_time = time.time()
+            texts = self.baseline_engine.predict(bill_crop)
+            processing_time = time.time() - start_time
+            
+            # Calculate metrics similar to benchmark_ocr.py
+            confidences = [t.get('confidence', 0) for t in texts]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            high_confidence_count = sum(1 for c in confidences if c > 0.9)
+            
+            return {
+                'model_name': 'Baseline PaddleOCR',
+                'texts': texts,
+                'total_texts': len(texts),
+                'processing_time': processing_time,
+                'avg_confidence': avg_confidence,
+                'high_confidence_count': high_confidence_count,
+                'confidences': confidences
+            }
             
         except Exception as e:
             return {
@@ -362,32 +604,31 @@ class OCRProcessingThread(QThread):
                 'texts': [],
                 'total_texts': 0,
                 'processing_time': 0,
-                'avg_confidence': 0,
                 'error': str(e)
             }
     
-    def _generate_comparison(self, ocr_results: Dict, baseline_results: Dict) -> Dict:
-        """Generate comparison between models"""
-        ocr_texts = ocr_results.get('texts', [])
+    def _generate_comparison(self, custom_results: Dict, baseline_results: Dict) -> Dict:
+        """Generate comparison between custom and baseline models (matching benchmark_ocr.py)"""
+        custom_texts = custom_results.get('texts', [])
         baseline_texts = baseline_results.get('texts', [])
         
         # Calculate statistics
-        ocr_confidences = [t.get('confidence', 0) for t in ocr_texts]
+        custom_confidences = [t.get('confidence', 0) for t in custom_texts]
         baseline_confidences = [t.get('confidence', 0) for t in baseline_texts]
         
         return {
-            'ocr_stats': {
-                'total_texts': len(ocr_texts),
-                'avg_confidence': np.mean(ocr_confidences) if ocr_confidences else 0,
-                'max_confidence': max(ocr_confidences) if ocr_confidences else 0,
-                'min_confidence': min(ocr_confidences) if ocr_confidences else 0,
-                'high_confidence_count': sum(1 for c in ocr_confidences if c > 0.9),
-                'very_high_confidence_count': sum(1 for c in ocr_confidences if c > 0.95),
-                'good_confidence_count': sum(1 for c in ocr_confidences if c > 0.8), 
-                'low_confidence_count': sum(1 for c in ocr_confidences if c < 0.5),
-                'confidence_std': np.std(ocr_confidences),
-                'confidence_median': np.median(ocr_confidences)
-                
+            'custom_stats': {
+                'total_texts': len(custom_texts),
+                'avg_confidence': np.mean(custom_confidences) if custom_confidences else 0,
+                'max_confidence': max(custom_confidences) if custom_confidences else 0,
+                'min_confidence': min(custom_confidences) if custom_confidences else 0,
+                'high_confidence_count': sum(1 for c in custom_confidences if c > 0.9),
+                'very_high_confidence_count': sum(1 for c in custom_confidences if c > 0.95),
+                'good_confidence_count': sum(1 for c in custom_confidences if c > 0.8), 
+                'low_confidence_count': sum(1 for c in custom_confidences if c < 0.5),
+                'confidence_std': np.std(custom_confidences) if custom_confidences else 0,
+                'confidence_median': np.median(custom_confidences) if custom_confidences else 0,
+                'processing_time': custom_results.get('processing_time', 0)
             },
             'baseline_stats': {
                 'total_texts': len(baseline_texts),
@@ -398,8 +639,9 @@ class OCRProcessingThread(QThread):
                 'very_high_confidence_count': sum(1 for c in baseline_confidences if c > 0.95),
                 'good_confidence_count': sum(1 for c in baseline_confidences if c > 0.8), 
                 'low_confidence_count': sum(1 for c in baseline_confidences if c < 0.5),
-                'confidence_std': np.std(baseline_confidences),
-                'confidence_median': np.median(baseline_confidences)
+                'confidence_std': np.std(baseline_confidences) if baseline_confidences else 0,
+                'confidence_median': np.median(baseline_confidences) if baseline_confidences else 0,
+                'processing_time': baseline_results.get('processing_time', 0)
             }
         }
     
@@ -411,9 +653,10 @@ class OCRProcessingThread(QThread):
         
         # Create folder 'gui_result' if it does not exist
         results_folder = Path(__file__).parent.parent / "gui_result"
-        results_folder.mkdir(exist_ok=True) 
+        if not os.path.exists(results_folder):
+            os.makedirs(results_folder)
             
-        file_path = results_folder / filename
+        file_path = os.path.join(results_folder, filename)
         
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False, default=str)
@@ -428,7 +671,8 @@ class OCRPipelineGUI(QMainWindow):
         
         # Initialize engines (matching benchmark_ocr.py)
         self.yolo_detector = None
-        self.ocr_engine = None
+        self.custom_engine = None    # DBNet + SVTR pipeline
+        self.baseline_engine = None  # Standard PaddleOCR
         
         # Processing thread
         self.processing_thread = None
@@ -628,7 +872,7 @@ class OCRPipelineGUI(QMainWindow):
         header_layout.addWidget(title_label)
         
         # Subtitle
-        subtitle_label = QLabel("Detected YOLO • OCR Model • PaddleOCR")
+        subtitle_label = QLabel("Detected YOLO • SVTR v6 • PaddleOCR")
         subtitle_label.setStyleSheet("color: #888888; font-size: 12px; margin: 5px;")
         header_layout.addWidget(subtitle_label)
         
@@ -824,13 +1068,13 @@ class OCRPipelineGUI(QMainWindow):
         comparison_widget = self.create_enhanced_comparison_tab()
         self.results_tabs.addTab(comparison_widget, "📊 Model Comparison")
         
-        # ocr details tab
-        ocr_widget = self.create_enhanced_detail_tab("OCR Model")
-        self.results_tabs.addTab(ocr_widget, "🤖 OCR Model Details")
+        # Custom details tab (DBNet + SVTR)
+        custom_widget = self.create_enhanced_detail_tab("Custom DBNet+SVTR")
+        self.results_tabs.addTab(custom_widget, "🤖 Custom Details")
         
-        # PaddleOCR details tab
-        baseline_widget = self.create_enhanced_detail_tab("PaddleOCR")
-        self.results_tabs.addTab(baseline_widget, "🧠 PaddleOCR Details")
+        # Baseline details tab (PaddleOCR)
+        baseline_widget = self.create_enhanced_detail_tab("Baseline PaddleOCR")
+        self.results_tabs.addTab(baseline_widget, "🧠 Baseline Details")
         
         # Performance analysis tab
         performance_widget = self.create_performance_analysis_tab()
@@ -861,7 +1105,7 @@ class OCRPipelineGUI(QMainWindow):
         # Enhanced comparison table
         self.comparison_table = QTableWidget()
         self.comparison_table.setColumnCount(3)
-        self.comparison_table.setHorizontalHeaderLabels(["Metrics", "OCR Model", "PaddleOCR"])
+        self.comparison_table.setHorizontalHeaderLabels(["Metrics", "Custom DBNet+SVTR", "Baseline PaddleOCR"])
         self.comparison_table.setAlternatingRowColors(True)
         self.comparison_table.verticalHeader().setVisible(False)
         self.comparison_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -892,7 +1136,7 @@ class OCRPipelineGUI(QMainWindow):
         self.performance_table = QTableWidget()
         self.performance_table.setColumnCount(4)
         self.performance_table.setHorizontalHeaderLabels([
-            "Metrics", "OCR Model", "PaddleOCR", "Evaluation"
+            "Metrics", "SVTR v6", "PaddleOCR", "Evaluation"
         ])
         self.performance_table.setAlternatingRowColors(True)
         self.performance_table.verticalHeader().setVisible(False)
@@ -941,9 +1185,9 @@ class OCRPipelineGUI(QMainWindow):
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSortingEnabled(True)
         
-        # Store reference
-        if model_name == "OCR Model":
-            self.ocr_table = table
+        # Store reference (updated naming)
+        if "Custom" in model_name:
+            self.custom_table = table
         else:
             self.baseline_table = table
         
@@ -1085,13 +1329,13 @@ class OCRPipelineGUI(QMainWindow):
         comparison_widget = self.create_comparison_tab()
         self.results_tabs.addTab(comparison_widget, "📊 Comparison")
         
-        # ocr details tab
-        ocr_widget = self.create_detail_tab("OCR Model")
-        self.results_tabs.addTab(ocr_widget, "🤖 OCR Model Details")
+        # SVTR details tab
+        svtr_widget = self.create_detail_tab("SVTR v6")
+        self.results_tabs.addTab(svtr_widget, "🤖 SVTR v6 Details")
         
         # PaddleOCR details tab
-        baseline_widget = self.create_detail_tab("PaddleOCR")
-        self.results_tabs.addTab(baseline_widget, "🧠 PaddleOCR Details")
+        paddle_widget = self.create_detail_tab("PaddleOCR")
+        self.results_tabs.addTab(paddle_widget, "🧠 PaddleOCR Details")
         
         layout.addWidget(self.results_tabs)
         return panel
@@ -1119,7 +1363,7 @@ class OCRPipelineGUI(QMainWindow):
         # Comparison table
         self.comparison_table = QTableWidget()
         self.comparison_table.setColumnCount(3)
-        self.comparison_table.setHorizontalHeaderLabels(["📊 Metrics", "🤖 OCR Model", "🧠 PaddleOCR"])
+        self.comparison_table.setHorizontalHeaderLabels(["📊 Metrics", "🤖 SVTR v6", "🧠 PaddleOCR"])
         layout.addWidget(self.comparison_table)
         
         return widget
@@ -1128,33 +1372,17 @@ class OCRPipelineGUI(QMainWindow):
         """Create detailed results tab"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-
-        # Model info header
-        model_info_label = QLabel(f"Recognition Results {model_name}")
-        model_info_label.setStyleSheet("""
-            background-color: #4CAF50; 
-            color: white; 
-            padding: 8px; 
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 14px;
-        """)
-        layout.addWidget(model_info_label)
-
+        
         # Create table for this model
         table = QTableWidget()
-        table.setColumnCount(5)  # Fixed: ensure 5 columns
-        table.setHorizontalHeaderLabels(["ID", "Text", "Conf", "Coords", "Evaluate"])
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
-        table.setSortingEnabled(True)
-
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["ID", "📝 Text", "📊 Conf", "📍 Coords", "🎯 Evaluation"])
+        
         # Store reference
-        if model_name == "OCR Model":
-            self.ocr_table = table
+        if model_name == "SVTR v6":
+            self.svtr_table = table
         else:
-            self.baseline_table = table
+            self.paddle_table = table
         
         layout.addWidget(table)
         return widget
@@ -1172,13 +1400,20 @@ class OCRPipelineGUI(QMainWindow):
             else:
                 self.log("❌ Failed to load YOLO detector")
             
-            # Initialize PaddleOCR Engine (handles both custom and baseline)
-            self.ocr_engine = PaddleOCREngine()
-            if self.ocr_engine.initialize():
-                self.log("✅ PaddleOCR engine loaded")
+            # Initialize Custom OCR Engine (DBNet + SVTR)
+            self.custom_engine = CustomOCREngine()
+            if self.custom_engine.initialize():
+                self.log("✅ Custom DBNet+SVTR engine loaded")
             else:
-                self.log("❌ Failed to load PaddleOCR engine")
-
+                self.log("❌ Failed to load Custom engine")
+            
+            # Initialize Baseline OCR Engine (Standard PaddleOCR)
+            self.baseline_engine = BaselineOCREngine()
+            if self.baseline_engine.initialize():
+                self.log("✅ Baseline PaddleOCR engine loaded")
+            else:
+                self.log("❌ Failed to load Baseline engine")
+            
             self.log("🎉 All engines initialized successfully!")
             
         except Exception as e:
@@ -1201,7 +1436,7 @@ class OCRPipelineGUI(QMainWindow):
         # Update processing status if relevant
         if "YOLO" in message:
             self.detection_status_label.setText(message)
-        elif "ocr" in message or "PaddleOCR" in message or "Xử lý" in message:
+        elif "SVTR" in message or "PaddleOCR" in message or "Xử lý" in message:
             self.processing_status_label.setText(message)
         
         # Auto scroll to bottom
@@ -1282,7 +1517,7 @@ class OCRPipelineGUI(QMainWindow):
         self.process_btn.setEnabled(False)
         self.select_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
         
         self.log("🚀 Starting OCR pipeline...")
         
@@ -1290,13 +1525,14 @@ class OCRPipelineGUI(QMainWindow):
         self.processing_thread = OCRProcessingThread(
             self.current_image_path,
             self.yolo_detector,
-            self.ocr_engine
+            self.custom_engine,      # DBNet + SVTR
+            self.baseline_engine     # Standard PaddleOCR
         )
         
         # Connect signals (updated signal names)
         self.processing_thread.progress_updated.connect(self.log)
         self.processing_thread.yolo_completed.connect(self.on_yolo_completed)
-        self.processing_thread.ocr_completed.connect(self.on_ocr_completed)
+        self.processing_thread.custom_completed.connect(self.on_custom_completed)
         self.processing_thread.baseline_completed.connect(self.on_baseline_completed)
         self.processing_thread.processing_completed.connect(self.on_processing_completed)
         self.processing_thread.error_occurred.connect(self.on_error_occurred)
@@ -1398,22 +1634,18 @@ class OCRPipelineGUI(QMainWindow):
                 color: #f44336;
             """)
     
-    def on_ocr_completed(self, ocr_results: Dict):
-        """Handle OCR Model completion"""
-        self.update_detail_table(self.ocr_table, ocr_results)
+    def on_custom_completed(self, custom_results: Dict):
+        """Handle custom OCR completion (DBNet + SVTR)"""
+        self.update_detail_table(self.custom_table, custom_results)
     
     def on_baseline_completed(self, baseline_results: Dict):
-        """Handle PaddleOCR completion"""
+        """Handle baseline OCR completion (PaddleOCR)"""
         self.update_detail_table(self.baseline_table, baseline_results)
     
     def update_detail_table(self, table: QTableWidget, results: Dict):
         """Update detail table with enhanced Vietnamese formatting"""
         texts = results.get('texts', [])
         table.setRowCount(len(texts))
-
-        if table.columnCount() != 5:
-            table.setColumnCount(5)
-            table.setHorizontalHeaderLabels(["ID", "Text", "Conf", "Coords", "Evaluate"])
         
         for i, text_info in enumerate(texts):
             # STT (Row number)
@@ -1459,13 +1691,9 @@ class OCRPipelineGUI(QMainWindow):
             bbox = text_info.get('bbox', [])
             
             if bbox and len(bbox) >= 4:
-                coord_str = f"({int(bbox[0])},{int(bbox[1])}) → ({int(bbox[2])},{int(bbox[3])})"
+                coord_str = f"({bbox[0]},{bbox[1]}) → ({bbox[2]},{bbox[3]})"
             elif coords and len(coords) > 0:
-                if isinstance(coords[0], list) and len(coords[0]) >= 2:
-                    # Handle coordinate points format
-                    coord_str = f"[{len(coords)} points]"
-                else:
-                    coord_str = f"({coords[0]:.0f},{coords[1]:.0f})" if len(coords) >= 2 else "Invalid"
+                coord_str = f"[{len(coords)} points]"
             else:
                 coord_str = "None"
             
@@ -1532,8 +1760,8 @@ class OCRPipelineGUI(QMainWindow):
         self.log("🎉 OCR pipeline completed successfully!")
     
     def update_comparison_table(self, comparison: Dict):
-        """Update comparison table with enhanced formatting"""
-        ocr_stats = comparison.get('ocr_stats', {})
+        """Update comparison table with enhanced formatting (updated naming)"""
+        custom_stats = comparison.get('custom_stats', {})
         baseline_stats = comparison.get('baseline_stats', {})
         
         metrics = [
@@ -1557,68 +1785,68 @@ class OCRPipelineGUI(QMainWindow):
             metric_item.setFont(QFont("Arial", 11, QFont.Bold))
             self.comparison_table.setItem(i, 0, metric_item)
             
-            # OCR Model value
-            ocr_value = ocr_stats.get(metric_key, 0)
-            if metric_key in ['avg_confidence', 'max_confidence', 'min_confidence', 'confidence_std', 'confidence_median']:
-                ocr_str = f"{ocr_value:.3f}"
+            # Custom value (DBNet + SVTR)
+            custom_value = custom_stats.get(metric_key, 0)
+            if metric_key in ['avg_confidence', 'max_confidence', 'min_confidence', 'confidence_std', 'confidence_median', 'processing_time']:
+                custom_str = f"{custom_value:.3f}"
             else:
-                ocr_str = str(int(ocr_value))
+                custom_str = str(int(custom_value))
             
-            ocr_item = QTableWidgetItem(ocr_str)
-            ocr_item.setFont(QFont("Arial", 11))
-            ocr_item.setBackground(QColor(33, 150, 243, 50))  # Light blue for OCR Model
-            self.comparison_table.setItem(i, 1, ocr_item)
+            custom_item = QTableWidgetItem(custom_str)
+            custom_item.setFont(QFont("Arial", 11))
+            custom_item.setBackground(QColor(33, 150, 243, 50))  # Light blue for Custom
+            self.comparison_table.setItem(i, 1, custom_item)
             
-            # PaddleOCR value
+            # Baseline value (PaddleOCR)
             baseline_value = baseline_stats.get(metric_key, 0)
-            if metric_key in ['avg_confidence', 'max_confidence', 'min_confidence', 'confidence_std', 'confidence_median']:
+            if metric_key in ['avg_confidence', 'max_confidence', 'min_confidence', 'confidence_std', 'confidence_median', 'processing_time']:
                 baseline_str = f"{baseline_value:.3f}"
             else:
                 baseline_str = str(int(baseline_value))
             
             baseline_item = QTableWidgetItem(baseline_str)
             baseline_item.setFont(QFont("Arial", 11))
-            baseline_item.setBackground(QColor(255, 87, 34, 50))  # Light orange for PaddleOCR
+            baseline_item.setBackground(QColor(255, 87, 34, 50))  # Light orange for Baseline
             self.comparison_table.setItem(i, 2, baseline_item)
             
             # Highlight better performance
-            if metric_key not in ["min_confidence", "low_confidence_count", "confidence_std"]:  # Higher is better
-                if ocr_value > baseline_value:
-                    ocr_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
-                elif baseline_value > ocr_value:
+            if metric_key not in ["min_confidence", "low_confidence_count", "confidence_std", "processing_time"]:  # Higher is better
+                if custom_value > baseline_value:
+                    custom_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
+                elif baseline_value > custom_value:
                     baseline_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
             else:  # Lower is better for these metrics
-                if ocr_value < baseline_value:
-                    ocr_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
-                elif baseline_value < ocr_value:
+                if custom_value < baseline_value:
+                    custom_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
+                elif baseline_value < custom_value:
                     baseline_item.setBackground(QColor(76, 175, 80, 100))  # Green highlight
         
         # Enhanced column sizing
         self.comparison_table.resizeColumnsToContents()
         self.comparison_table.setColumnWidth(0, 280)  # Metric column
-        self.comparison_table.setColumnWidth(1, 120)  # ocr column
-        self.comparison_table.setColumnWidth(2, 120)  # PaddleOCR column
+        self.comparison_table.setColumnWidth(1, 120)  # Custom column
+        self.comparison_table.setColumnWidth(2, 120)  # Baseline column
     
     def update_summary(self, results: Dict):
         """Update summary with enhanced formatting (updated naming)"""
         yolo = results.get('yolo_detection', {})
-        ocr = results.get('ocr_results', {})
+        custom = results.get('custom_results', {})
         baseline = results.get('baseline_results', {})
         best_detection = yolo.get('best_detection', {})
         
         # Calculate processing stats
-        ocr_texts = ocr.get('total_texts', 0)
+        custom_texts = custom.get('total_texts', 0)
         baseline_texts = baseline.get('total_texts', 0)
         
         # Determine better performer
-        ocr_avg_conf = ocr.get('avg_confidence', 0) if ocr_texts > 0 else 0
+        custom_avg_conf = custom.get('avg_confidence', 0) if custom_texts > 0 else 0
         baseline_avg_conf = baseline.get('avg_confidence', 0) if baseline_texts > 0 else 0
         
-        better_model = "ocr v6" if ocr_avg_conf > baseline_avg_conf else "PaddleOCR"
-        better_color = "#4CAF50" if ocr_avg_conf > baseline_avg_conf else "#FF9800"
+        better_model = "Custom DBNet+SVTR" if custom_avg_conf > baseline_avg_conf else "Baseline PaddleOCR"
+        better_color = "#4CAF50" if custom_avg_conf > baseline_avg_conf else "#FF9800"
         
         # Calculate additional metrics
-        ocr_high_conf = sum(1 for t in ocr.get('texts', []) if t.get('confidence', 0) > 0.9)
+        custom_high_conf = sum(1 for t in custom.get('texts', []) if t.get('confidence', 0) > 0.9)
         baseline_high_conf = sum(1 for t in baseline.get('texts', []) if t.get('confidence', 0) > 0.9)
         
         summary_text = f"""
@@ -1642,13 +1870,13 @@ class OCRPipelineGUI(QMainWindow):
     <th style="padding: 8px; text-align: center; border: 1px solid #666;">High (>0.9)</th>
 </tr>
 <tr>
-    <td style="padding: 8px; border: 1px solid #666;">🤖 OCR Model</td>
-    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{ocr_texts}</strong></td>
-    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{ocr_avg_conf:.3f}</strong></td>
-    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{ocr_high_conf}</strong></td>
+    <td style="padding: 8px; border: 1px solid #666;">🤖 Custom DBNet+SVTR</td>
+    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{custom_texts}</strong></td>
+    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{custom_avg_conf:.3f}</strong></td>
+    <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{custom_high_conf}</strong></td>
 </tr>
 <tr>
-    <td style="padding: 8px; border: 1px solid #666;">🧠 PaddleOCR</td>
+    <td style="padding: 8px; border: 1px solid #666;">🧠 Baseline PaddleOCR</td>
     <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{baseline_texts}</strong></td>
     <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{baseline_avg_conf:.3f}</strong></td>
     <td style="padding: 8px; text-align: center; border: 1px solid #666;"><strong>{baseline_high_conf}</strong></td>
@@ -1661,9 +1889,10 @@ class OCRPipelineGUI(QMainWindow):
 <p style="margin-top: 10px; color: #888; font-size: 12px;">⏱️ Processing time: {results.get('timestamp', 'Not available')[:19]}</p>
 
 <h4 style="color: #9C27B0; margin: 15px 0 10px 0;">📈 Detailed Statistics</h4>
-<p>• Total Processing Time: <strong>{results.get('total_processing_time', 'Not available')}</strong></p>
-<p>• Number of very high confidence texts (>0.95): <strong>OCR Model: {sum(1 for t in ocr.get('texts', []) if t.get('confidence', 0) > 0.95)} | PaddleOCR: {sum(1 for t in baseline.get('texts', []) if t.get('confidence', 0) > 0.95)}</strong></p>
-<p>• High-quality text rate: <strong>OCR Model: {(ocr_high_conf/ocr_texts*100 if ocr_texts > 0 else 0):.1f}% | PaddleOCR: {(baseline_high_conf/baseline_texts*100 if baseline_texts > 0 else 0):.1f}%</strong></p>
+<p>• Custom Processing Time: <strong>{custom.get('processing_time', 0):.3f}s</strong></p>
+<p>• Baseline Processing Time: <strong>{baseline.get('processing_time', 0):.3f}s</strong></p>
+<p>• Number of very high confidence texts (>0.95): <strong>Custom: {sum(1 for t in custom.get('texts', []) if t.get('confidence', 0) > 0.95)} | Baseline: {sum(1 for t in baseline.get('texts', []) if t.get('confidence', 0) > 0.95)}</strong></p>
+<p>• High-quality text rate: <strong>Custom: {(custom_high_conf/custom_texts*100 if custom_texts > 0 else 0):.1f}% | Baseline: {(baseline_high_conf/baseline_texts*100 if baseline_texts > 0 else 0):.1f}%</strong></p>
 </div>
         """
         
