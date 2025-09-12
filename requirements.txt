@@ -13,14 +13,6 @@ torchvision==0.16.0
 torchaudio==2.1.0
 ultralytics>=8.0.196
 
-# Tokenizer
-transformers==4.35.2 
-datasets==2.4.0 
-tokenizers==0.14
-huggingface-hub==0.16.4 
-accelerate==0.21.0 
-sentencepiece==0.1.97
-
 # OCR - PaddlePaddle ecosystem
 paddlepaddle==2.6.2
 paddleocr==2.6.1.3
